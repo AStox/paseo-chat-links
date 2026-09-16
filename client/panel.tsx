@@ -265,11 +265,23 @@ function LinksForAgent({
           </View>
         </View>
       ) : null}
-      {query.data?.error ? <Text style={styles.attention}>{query.data.error}</Text> : null}
+      {query.data?.error ? (
+        <View style={styles.card}>
+          <View style={styles.body}>
+            <Text style={styles.ident}>Could not load links</Text>
+            <Text style={styles.attention}>{query.data.error}</Text>
+          </View>
+        </View>
+      ) : null}
       {query.error ? (
-        <Text style={styles.attention}>
-          {query.error instanceof Error ? query.error.message : String(query.error)}
-        </Text>
+        <View style={styles.card}>
+          <View style={styles.body}>
+            <Text style={styles.ident}>Could not load links</Text>
+            <Text style={styles.attention}>
+              {query.error instanceof Error ? query.error.message : String(query.error)}
+            </Text>
+          </View>
+        </View>
       ) : null}
       {!agentId ? (
         <View style={styles.card}>
@@ -278,7 +290,7 @@ function LinksForAgent({
           </View>
         </View>
       ) : null}
-      {ready && items.length === 0 && !query.isFetching ? (
+      {ready && items.length === 0 && !query.data?.error && !query.error && !query.isFetching ? (
         <View style={styles.card}>
           <View style={styles.body}>
             <Text style={styles.title}>No ticket or PR for this chat yet.</Text>

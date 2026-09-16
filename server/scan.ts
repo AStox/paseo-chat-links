@@ -4,6 +4,7 @@ import path from "node:path";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import { mentionKey, type Mention } from "../shared/parse";
 import type { ChatLinkItem } from "../shared/rpc";
+import { pluginEnv } from "./env";
 import { pickSessionLinks, threadMentions, type Thread, type ThreadLine } from "./pick";
 
 const HOME = process.env.HOME || os.homedir();
@@ -47,8 +48,9 @@ async function readLinearToken(): Promise<string> {
 
 async function loadSecrets(): Promise<void> {
   if (secretsLoaded) return;
-  githubToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN || "";
-  linearToken = process.env.LINEAR_API_KEY || (await readLinearToken());
+  githubToken =
+    (await pluginEnv("GITHUB_TOKEN")) || (await pluginEnv("GH_TOKEN")) || "";
+  linearToken = (await pluginEnv("LINEAR_API_KEY")) || (await readLinearToken());
   secretsLoaded = true;
 }
 
@@ -488,13 +490,13 @@ export async function listChatLinks(
   }
 
   const titles = await fetchTitles(threadMentions(thread));
-  const mentions = await pickSessionLinks(thread, titles);
+  const picked = await pickSessionLinks(thread, titles);
   console.log(
-    `chat-links ${input.agentId} ${thread.lines.length} lines -> ${mentions.map((mention) => mentionKey(mention)).join(",") || "none"}`,
+    `chat-links ${input.agentId} ${thread.lines.length} lines -> ${picked.mentions.map((mention) => mentionKey(mention)).join(",") || "none"}${picked.error ? ` error=${picked.error}` : ""}`,
   );
   const seen = await readSeen();
   const items = (
-    await Promise.all(mentions.map((mention) => resolveMention(mention, seen[mentionKey(mention)], scannedAt)))
+    await Promise.all(picked.mentions.map((mention) => resolveMention(mention, seen[mentionKey(mention)], scannedAt)))
   ).filter((item): item is ChatLinkItem => item !== null);
 
   let wrote = false;
@@ -506,7 +508,7 @@ export async function listChatLinks(
   }
   if (wrote) await writeSeen(seen);
 
-  return { items, scannedAt, error: null };
+  return { items, scannedAt, error: picked.error };
 }
 
 export async function markChatLinkSeen(input: { id: string }, _context: PluginHandlerContext): Promise<{ ok: boolean }> {

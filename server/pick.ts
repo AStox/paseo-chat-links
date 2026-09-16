@@ -3,6 +3,7 @@ import {
   parseMentions,
   type Mention,
 } from "../shared/parse";
+import { pluginEnv } from "./env";
 
 const JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const TICKET_NOUL = 0.9;
@@ -57,17 +58,19 @@ function snippet(thread: Thread, mention: Mention): string {
 }
 
 async function typesafeKey(): Promise<string> {
-  return process.env.TYPESAFE_API_KEY?.trim() || "";
+  return pluginEnv("TYPESAFE_API_KEY");
 }
 
 async function askJev(
   thread: Thread,
   candidates: Mention[],
   titles: Record<string, string>,
-): Promise<Mention[] | null> {
+): Promise<Mention[]> {
   if (candidates.length === 0) return [];
   const key = await typesafeKey();
-  if (!key) return null;
+  if (!key) {
+    throw new Error("TYPESAFE_API_KEY is missing. Set it on the daemon or in ~/.paseo/chat-links.env");
+  }
 
   const questions: Record<
     string,
@@ -117,7 +120,7 @@ async function askJev(
   } finally {
     clearTimeout(timer);
   }
-  if (!res.ok) return null;
+  if (!res.ok) throw new Error(`Jev HTTP ${res.status}`);
   const body = (await res.json()) as { answers?: Record<string, { noul?: number }> };
   const answers = body.answers ?? {};
   const scored = candidates.map((mention, index) => ({
@@ -166,13 +169,19 @@ export function threadMentions(thread: Thread): Mention[] {
 export async function pickSessionLinks(
   thread: Thread,
   titles: Record<string, string> = {},
-): Promise<Mention[]> {
+): Promise<{ mentions: Mention[]; error: string | null }> {
   const candidates = threadMentions(thread);
-  if (candidates.length === 0) return [];
+  if (candidates.length === 0) return { mentions: [], error: null };
   try {
-    const picked = (await askJev(thread, candidates, titles)) ?? [];
-    return [...picked, ...ticketsFromKeptPrTitles(picked, titles)];
-  } catch {
-    return [];
+    const picked = await askJev(thread, candidates, titles);
+    return { mentions: [...picked, ...ticketsFromKeptPrTitles(picked, titles)], error: null };
+  } catch (error) {
+    const raw = error instanceof Error ? error.message : String(error);
+    const message =
+      error instanceof Error && (error.name === "AbortError" || /aborted/i.test(raw))
+        ? "Jev timed out"
+        : raw;
+    console.log(`chat-links jev failed: ${message}`);
+    return { mentions: [], error: message };
   }
 }
