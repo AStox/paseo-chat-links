@@ -1,0 +1,6 @@
+{
+  "id": "chat-links",
+  "requirements": {
+    "paseo": ">=0.8.0"
+  }
+}
