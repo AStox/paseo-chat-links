@@ -5,6 +5,7 @@ export type Snapshot = {
   checks: string | null;
   assignee: string | null;
   priority: string | null;
+  legacy?: true;
 };
 
 export type SnapshotStore = Record<string, Snapshot | string>;
@@ -12,7 +13,7 @@ export type SnapshotStore = Record<string, Snapshot | string>;
 export function parseSnapshot(raw: Snapshot | string | undefined): Snapshot | null {
   if (!raw) return null;
   if (typeof raw === "string") {
-    return { at: raw, status: "", stateType: null, checks: null, assignee: null, priority: null };
+    return { at: raw, status: "", stateType: null, checks: null, assignee: null, priority: null, legacy: true };
   }
   if (!raw.at) return null;
   return raw;
@@ -70,6 +71,7 @@ export function namedDeltas(input: {
 
   const n = input.commentTimes.filter((stamp) => stamp > snap.at && stamp <= input.now).length;
   if (n > 0) reasons.push(`${n} new comment${n === 1 ? "" : "s"}`);
+  if (snap.legacy) return reasons;
 
   if (snap.checks !== input.checks) {
     if (input.checks === "failing") reasons.push("checks failed");

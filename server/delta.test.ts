@@ -84,4 +84,21 @@ assert.deepEqual(
   "assignee changed",
 );
 
+const legacy = parseSnapshot(at);
+const legacyInput = {
+  snapshot: legacy,
+  now: later,
+  status: "In Progress",
+  stateType: "started",
+  checks: null,
+  assignee: "adam",
+  priority: "High",
+};
+assert.deepEqual(
+  namedDeltas({ ...legacyInput, commentTimes: ["2026-09-18T12:30:00.000Z"] }),
+  ["1 new comment"],
+  "legacy snapshot only reports comments",
+);
+assert.deepEqual(namedDeltas({ ...legacyInput, commentTimes: [] }), [], "legacy snapshot has no field deltas");
+
 console.log("delta tests ok");
