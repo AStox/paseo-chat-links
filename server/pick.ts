@@ -6,8 +6,6 @@ import {
 import { pluginEnv } from "./env";
 
 const JEV_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
-const TICKET_NOUL = 0.9;
-const PR_NOUL = 0.9;
 
 export type ThreadLine = { role: "user" | "assistant"; text: string; at: string };
 
@@ -41,6 +39,15 @@ function ranked(thread: Thread): Array<{ mention: Mention; score: number }> {
     addScores(scores, line.text, 2, false);
   }
   return [...scores.values()].sort((left, right) => right.score - left.score);
+}
+
+export function pickByNoul<T>(rows: Array<{ item: T; noul: number }>): T[] {
+  const sorted = [...rows].sort((left, right) => right.noul - left.noul);
+  const high = sorted.filter((row) => row.noul >= 0.9);
+  if (high.length) return high.map((row) => row.item);
+  const mid = sorted.filter((row) => row.noul >= 0.75).slice(0, 3);
+  if (mid.length) return mid.map((row) => row.item);
+  return sorted.filter((row) => row.noul >= 0.5).slice(0, 2).map((row) => row.item);
 }
 
 function label(mention: Mention): string {
@@ -79,15 +86,15 @@ async function askJev(
   candidates.forEach((mention, index) => {
     const name = label(mention);
     const itemTitle = titles[mentionKey(mention)];
-    const kind = mention.kind === "linear" ? "Linear ticket" : "GitHub pull request";
+    const kind = mention.kind === "pr" ? "pull request" : "Linear ticket";
     questions[`c${index}`] = {
       type: "noul",
       instructions: itemTitle
-        ? `Is ${name} (${itemTitle}) a ${kind} this chat is working on (implementing, testing, reviewing, or tracking)?`
-        : `Is ${name} a ${kind} this chat is working on (implementing, testing, reviewing, or tracking)?`,
+        ? `Is ${name} (${itemTitle}) the ${kind} this conversation is using to address the problem it discussed?`
+        : `Is ${name} the ${kind} this conversation is using to address the problem it discussed?`,
       criteria: {
-        true: "The chat is doing work on this item, including testing or reviewing an existing PR or creating the ticket",
-        false: "A passing mention, docs, example, EIP/ERC, or someone else's item",
+        true: "The chat is implementing, opening, or waiting on this for the problem in the conversation",
+        false: "Mentioned only as background or prior work",
       },
     };
   });
@@ -120,27 +127,49 @@ async function askJev(
   } finally {
     clearTimeout(timer);
   }
-  if (!res.ok) throw new Error(`Jev HTTP ${res.status}`);
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const text = (await res.text()).trim();
+      try {
+        const parsed = JSON.parse(text) as {
+          error?: { message?: unknown } | string;
+          message?: unknown;
+          detail?: unknown;
+        };
+        const found = [
+          typeof parsed.error === "object" ? parsed.error?.message : undefined,
+          parsed.message,
+          parsed.error,
+          parsed.detail,
+        ].find((value): value is string => typeof value === "string");
+        detail = found ?? "";
+      } catch {
+        detail = text;
+      }
+    } catch {
+      detail = "";
+    }
+    detail = detail.trim().slice(0, 200);
+    throw new Error(detail ? `Jev HTTP ${res.status}: ${detail}` : `Jev HTTP ${res.status}`);
+  }
   const body = (await res.json()) as { answers?: Record<string, { noul?: number }> };
-  const answers = body.answers ?? {};
+  if (!body.answers || typeof body.answers !== "object") throw new Error("Jev returned no answers");
+  const answers = body.answers;
   const scored = candidates.map((mention, index) => ({
     mention,
     noul: answers[`c${index}`]?.noul ?? 0,
   }));
   const picked: Mention[] = [];
   picked.push(
-    ...scored
-      .filter((row) => row.mention.kind === "linear" && row.noul >= TICKET_NOUL)
-      .sort((a, b) => b.noul - a.noul)
-      .slice(0, 3)
-      .map((row) => row.mention),
+    ...pickByNoul(
+      scored.filter((row) => row.mention.kind === "linear").map((row) => ({ item: row.mention, noul: row.noul })),
+    ),
   );
   picked.push(
-    ...scored
-      .filter((row) => row.mention.kind === "pr" && row.noul >= PR_NOUL)
-      .sort((a, b) => b.noul - a.noul)
-      .slice(0, 3)
-      .map((row) => row.mention),
+    ...pickByNoul(
+      scored.filter((row) => row.mention.kind === "pr").map((row) => ({ item: row.mention, noul: row.noul })),
+    ),
   );
   return picked;
 }
@@ -169,12 +198,12 @@ export function threadMentions(thread: Thread): Mention[] {
 export async function pickSessionLinks(
   thread: Thread,
   titles: Record<string, string> = {},
-): Promise<{ mentions: Mention[]; error: string | null }> {
+): Promise<{ mentions: Mention[]; jevError: string | null }> {
   const candidates = threadMentions(thread);
-  if (candidates.length === 0) return { mentions: [], error: null };
+  if (candidates.length === 0) return { mentions: [], jevError: null };
   try {
     const picked = await askJev(thread, candidates, titles);
-    return { mentions: [...picked, ...ticketsFromKeptPrTitles(picked, titles)], error: null };
+    return { mentions: [...picked, ...ticketsFromKeptPrTitles(picked, titles)], jevError: null };
   } catch (error) {
     const raw = error instanceof Error ? error.message : String(error);
     const message =
@@ -182,6 +211,6 @@ export async function pickSessionLinks(
         ? "Jev timed out"
         : raw;
     console.log(`chat-links jev failed: ${message}`);
-    return { mentions: [], error: message };
+    return { mentions: candidates, jevError: message };
   }
 }

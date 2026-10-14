@@ -34,7 +34,7 @@ export function contributeChrome(client: PluginClientContext) {
 
   const openLinks = (workspaceId: string, agentId: string) => {
     setFocusedAgent(agentId);
-    client.openPanel("chat-links-workspace", { workspaceId, location: "explorer" });
+    client.openPanel("chat-links", { workspaceId, agentId, location: "explorer" });
   };
 
   const register = (agent: AgentRef) => {
@@ -63,6 +63,7 @@ export function contributeChrome(client: PluginClientContext) {
           },
         }),
       );
+
     }
 
     pills.get(agentId)?.remove();
@@ -93,7 +94,12 @@ export function contributeChrome(client: PluginClientContext) {
   };
 
   void agents
-    .list({ subscribe: {}, signal: lifetime.signal })
+    .list({
+      subscribe: {},
+      signal: lifetime.signal,
+      filter: { includeArchived: false },
+      page: { limit: 200 },
+    })
     .then((result) => {
       if (stopped) return;
       if (result.subscription) {
@@ -118,7 +124,10 @@ export function contributeChrome(client: PluginClientContext) {
     .catch(async () => {
       if (stopped) return;
       try {
-        const page = await agents.list({ scope: "active", page: { limit: 50 } });
+        const page = await agents.list({
+          filter: { includeArchived: false },
+          page: { limit: 200 },
+        });
         if (stopped) return;
         for (const { agent } of page.entries ?? []) register(agent);
       } catch (error) {

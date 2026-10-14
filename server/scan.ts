@@ -4,7 +4,9 @@ import path from "node:path";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import { mentionKey, type Mention } from "../shared/parse";
 import type { ChatLinkItem } from "../shared/rpc";
+import { namedDeltas, parseSnapshot, mergeReasons, snapshotFromItem, type SnapshotStore } from "./delta";
 import { pluginEnv } from "./env";
+import { githubUnread, linearUnread, markGithubThreads, markLinearNotes } from "./inbox";
 import { pickSessionLinks, threadMentions, type Thread, type ThreadLine } from "./pick";
 
 const HOME = process.env.HOME || os.homedir();
@@ -18,7 +20,23 @@ const LINEAR_CREDENTIALS = path.join(HOME, ".config", "linear", "credentials.tom
 const POLL_PAGES = 4;
 const PAGE_SIZE = 200;
 
-type SeenMap = Record<string, string>;
+type SeenMap = SnapshotStore;
+type PickCache = { fingerprint: string; mentions: Mention[] };
+
+const pickByAgent = new Map<string, PickCache>();
+const noPeople = {
+  assignee: null,
+  priority: null,
+  project: null,
+  stateType: null,
+  avatarUrl: null,
+  checks: null,
+};
+
+function threadFingerprint(thread: Thread, candidates: Mention[]): string {
+  const last = thread.lines[thread.lines.length - 1];
+  return `${thread.lines.length}|${last?.at ?? ""}|${candidates.map(mentionKey).join(",")}`;
+}
 
 let githubToken = "";
 let linearToken = "";
@@ -209,12 +227,12 @@ async function fetchTitles(mentions: Mention[]): Promise<Record<string, string>>
   return titles;
 }
 
-function countNew(timestamps: string[], lastSeen: string | undefined, scannedAt: string): number {
-  if (!lastSeen) return 0;
-  return timestamps.filter((stamp) => stamp > lastSeen && stamp <= scannedAt).length;
-}
 
-async function resolveLinear(mention: Extract<Mention, { kind: "linear" }>, lastSeen: string | undefined, scannedAt: string): Promise<ChatLinkItem | null> {
+async function resolveLinear(
+  mention: Extract<Mention, { kind: "linear" }>,
+  lastSeen: SnapshotStore[string] | undefined,
+  scannedAt: string,
+): Promise<ChatLinkItem | null> {
   const data = (await linearGraphql(
     `query ($id: String!) {
       issue(id: $id) {
@@ -223,7 +241,9 @@ async function resolveLinear(mention: Extract<Mention, { kind: "linear" }>, last
         url
         updatedAt
         state { name type }
-        assignee { displayName }
+        priorityLabel
+        assignee { displayName avatarUrl }
+        project { name }
         comments(first: 50) { nodes { createdAt user { displayName } } }
       }
     }`,
@@ -235,7 +255,9 @@ async function resolveLinear(mention: Extract<Mention, { kind: "linear" }>, last
       url: string;
       updatedAt: string;
       state: { name: string; type: string } | null;
-      assignee: { displayName: string } | null;
+      priorityLabel: string | null;
+      assignee: { displayName: string; avatarUrl: string | null } | null;
+      project: { name: string } | null;
       comments: { nodes: Array<{ createdAt: string; user: { displayName: string } | null }> };
     } | null;
   };
@@ -245,13 +267,23 @@ async function resolveLinear(mention: Extract<Mention, { kind: "linear" }>, last
     const name = node.user?.displayName?.toLowerCase() ?? "";
     return !linearMe || name !== linearMe;
   });
-  const newComments = countNew(comments.map((node) => node.createdAt), lastSeen, scannedAt);
-  const reasons: string[] = [];
-  if (newComments > 0) reasons.push(`${newComments} new comment${newComments === 1 ? "" : "s"}`);
+  const snap = parseSnapshot(lastSeen);
+  const commentTimes = comments.map((node) => node.createdAt);
+  const newComments = snap ? commentTimes.filter((stamp) => stamp > snap.at && stamp <= scannedAt).length : 0;
   const stateName = issue.state?.name ?? "Unknown";
-  if (/block|review required/i.test(stateName)) reasons.push(stateName);
-  const assignedToMe = !!linearMe && issue.assignee?.displayName.toLowerCase() === linearMe;
-  if (assignedToMe && /review/i.test(stateName)) reasons.push("your review");
+  const assignee = issue.assignee?.displayName ?? null;
+  const priority = issue.priorityLabel && issue.priorityLabel !== "No priority" ? issue.priorityLabel : null;
+  const stateType = issue.state?.type ?? null;
+  const reasons = namedDeltas({
+    snapshot: snap,
+    now: scannedAt,
+    status: stateName,
+    stateType,
+    checks: null,
+    assignee,
+    priority,
+    commentTimes,
+  });
   return {
     id: mentionKey(mention),
     kind: "linear",
@@ -259,6 +291,12 @@ async function resolveLinear(mention: Extract<Mention, { kind: "linear" }>, last
     title: issue.title,
     url: issue.url,
     status: stateName,
+    assignee: issue.assignee?.displayName ?? null,
+    priority: issue.priorityLabel && issue.priorityLabel !== "No priority" ? issue.priorityLabel : null,
+    project: issue.project?.name ?? null,
+    stateType: issue.state?.type ?? null,
+    avatarUrl: issue.assignee?.avatarUrl ?? null,
+    checks: null,
     needsAttention: reasons.length > 0,
     newComments,
     reasons,
@@ -267,7 +305,11 @@ async function resolveLinear(mention: Extract<Mention, { kind: "linear" }>, last
   };
 }
 
-async function resolvePr(mention: Extract<Mention, { kind: "pr" }>, lastSeen: string | undefined, scannedAt: string): Promise<ChatLinkItem> {
+async function resolvePr(
+  mention: Extract<Mention, { kind: "pr" }>,
+  lastSeen: SnapshotStore[string] | undefined,
+  scannedAt: string,
+): Promise<ChatLinkItem> {
   const data = (await githubGraphql(
     `query ($owner: String!, $name: String!, $number: Int!) {
       repository(owner: $owner, name: $name) {
@@ -279,6 +321,7 @@ async function resolvePr(mention: Extract<Mention, { kind: "pr" }>, lastSeen: st
           mergeable
           reviewDecision
           updatedAt
+          author { login avatarUrl }
           reviewRequests(first: 20) {
             nodes { requestedReviewer { ... on User { login } } }
           }
@@ -307,6 +350,7 @@ async function resolvePr(mention: Extract<Mention, { kind: "pr" }>, lastSeen: st
         mergeable: string | null;
         reviewDecision: string | null;
         updatedAt: string;
+        author: { login: string; avatarUrl: string } | null;
         reviewRequests: { nodes: Array<{ requestedReviewer: { login?: string } | null }> };
         comments: { nodes: Array<{ updatedAt: string; author: { login: string } | null }> };
         reviews: { nodes: Array<{ submittedAt: string | null; author: { login: string } | null }> };
@@ -329,6 +373,7 @@ async function resolvePr(mention: Extract<Mention, { kind: "pr" }>, lastSeen: st
       title: `PR #${mention.number}`,
       url: `https://github.com/${mention.owner}/${mention.repo}/pull/${mention.number}`,
       status: "missing",
+      ...noPeople,
       needsAttention: false,
       newComments: 0,
       reasons: [],
@@ -353,30 +398,46 @@ async function resolvePr(mention: Extract<Mention, { kind: "pr" }>, lastSeen: st
     if (githubMe && last.author?.login === githubMe) continue;
     stamps.push(last.updatedAt);
   }
-  const newComments = countNew(stamps, lastSeen, scannedAt);
-  const reasons: string[] = [];
-  if (newComments > 0) reasons.push(`${newComments} new comment${newComments === 1 ? "" : "s"}`);
-  if (pr.reviewDecision === "CHANGES_REQUESTED") reasons.push("changes requested");
-  if (pr.mergeable === "CONFLICTING") reasons.push("merge conflict");
+  const snap = parseSnapshot(lastSeen);
+  const newComments = snap ? stamps.filter((stamp) => stamp > snap.at && stamp <= scannedAt).length : 0;
   const check = pr.commits.nodes[0]?.commit.statusCheckRollup?.state;
-  if (check === "FAILURE" || check === "ERROR") reasons.push("checks failing");
-  const reviewRequested = pr.reviewRequests.nodes.some(
-    (node) => githubMe && node.requestedReviewer?.login === githubMe,
-  );
-  if (reviewRequested) reasons.push("review requested");
-  const unresolved = pr.reviewThreads.nodes.filter((thread) => !thread.isResolved).length;
-  if (unresolved > 0) reasons.push(`${unresolved} unresolved thread${unresolved === 1 ? "" : "s"}`);
-
-  const statusParts = [pr.isDraft ? "draft" : pr.state.toLowerCase()];
+  const state = pr.state.toLowerCase();
+  const stateType = state === "open" && pr.isDraft ? "draft" : state;
+  const statusParts = [stateType];
   if (pr.reviewDecision) statusParts.push(pr.reviewDecision.toLowerCase().replaceAll("_", " "));
-
+  const status = statusParts.join(" · ");
+  const checks =
+    check === "SUCCESS"
+      ? "passing"
+      : check === "FAILURE" || check === "ERROR"
+        ? "failing"
+        : check === "PENDING" || check === "EXPECTED"
+          ? "pending"
+          : null;
+  const assignee = pr.author?.login ?? null;
+  const reasons = namedDeltas({
+    snapshot: snap,
+    now: scannedAt,
+    status,
+    stateType,
+    checks,
+    assignee,
+    priority: null,
+    commentTimes: stamps,
+  });
   return {
     id: mentionKey(mention),
     kind: "pr",
     label: `${mention.owner}/${mention.repo}#${mention.number}`,
     title: pr.title,
     url: pr.url,
-    status: statusParts.join(" · "),
+    status,
+    assignee,
+    priority: null,
+    project: null,
+    stateType,
+    avatarUrl: pr.author?.avatarUrl ?? null,
+    checks,
     needsAttention: reasons.length > 0,
     newComments,
     reasons,
@@ -387,7 +448,7 @@ async function resolvePr(mention: Extract<Mention, { kind: "pr" }>, lastSeen: st
 
 async function resolveMention(
   mention: Mention,
-  lastSeen: string | undefined,
+  lastSeen: SnapshotStore[string] | undefined,
   scannedAt: string,
 ): Promise<ChatLinkItem | null> {
   try {
@@ -400,6 +461,7 @@ async function resolveMention(
           title: mention.id,
           url: `https://linear.app/issue/${mention.id}`,
           status: "unknown",
+          ...noPeople,
           needsAttention: false,
           newComments: 0,
           reasons: [],
@@ -417,6 +479,7 @@ async function resolveMention(
         title: `PR #${mention.number}`,
         url: `https://github.com/${mention.owner}/${mention.repo}/pull/${mention.number}`,
         status: "unknown",
+        ...noPeople,
         needsAttention: false,
         newComments: 0,
         reasons: [],
@@ -442,6 +505,7 @@ async function resolveMention(
           ? `https://linear.app/issue/${mention.id}`
           : `https://github.com/${mention.owner}/${mention.repo}/pull/${mention.number}`,
       status: "error",
+      ...noPeople,
       needsAttention: false,
       newComments: 0,
       reasons: [],
@@ -454,7 +518,7 @@ async function resolveMention(
 export async function listChatLinks(
   input: { agentId: string },
   { paseo }: PluginHandlerContext,
-): Promise<{ items: ChatLinkItem[]; scannedAt: string; error: string | null }> {
+): Promise<{ items: ChatLinkItem[]; scannedAt: string; error: string | null; jevError: string | null }> {
   const scannedAt = new Date().toISOString();
   await loadSecrets();
   if (githubToken && githubMe === null) {
@@ -486,34 +550,98 @@ export async function listChatLinks(
       items: [],
       scannedAt,
       error: error instanceof Error ? error.message : String(error),
+      jevError: null,
     };
   }
 
-  const titles = await fetchTitles(threadMentions(thread));
-  const picked = await pickSessionLinks(thread, titles);
-  console.log(
-    `chat-links ${input.agentId} ${thread.lines.length} lines -> ${picked.mentions.map((mention) => mentionKey(mention)).join(",") || "none"}${picked.error ? ` error=${picked.error}` : ""}`,
-  );
+  const candidates = threadMentions(thread);
+  const fingerprint = threadFingerprint(thread, candidates);
+  const cached = pickByAgent.get(input.agentId);
+  let picked: { mentions: Mention[]; jevError: string | null };
+  if (cached && cached.fingerprint === fingerprint) {
+    picked = { mentions: cached.mentions, jevError: null };
+  } else {
+    const titles = await fetchTitles(candidates);
+    picked = await pickSessionLinks(thread, titles);
+    if (picked.jevError === null) pickByAgent.set(input.agentId, { fingerprint, mentions: picked.mentions });
+    console.log(
+      `chat-links ${input.agentId} ${thread.lines.length} lines -> ${picked.mentions.map((mention) => mentionKey(mention)).join(",") || "none"}${picked.jevError !== null ? ` jevError=${picked.jevError}` : ""}`,
+    );
+  }
   const seen = await readSeen();
   const items = (
     await Promise.all(picked.mentions.map((mention) => resolveMention(mention, seen[mentionKey(mention)], scannedAt)))
   ).filter((item): item is ChatLinkItem => item !== null);
-
-  let wrote = false;
+  const [gh, lin] = await Promise.all([
+    githubUnread(githubToken, items),
+    linearUnread(linearToken, items),
+  ]);
   for (const item of items) {
-    if (!seen[item.id]) {
-      seen[item.id] = scannedAt;
-      wrote = true;
-    }
+    const extra = [...(gh.reasons.get(item.id) ?? []), ...(lin.reasons.get(item.id) ?? [])];
+    item.reasons = mergeReasons(item.reasons, extra);
+    item.needsAttention = item.reasons.length > 0;
   }
-  if (wrote) await writeSeen(seen);
 
-  return { items, scannedAt, error: picked.error };
+  return { items, scannedAt, error: null, jevError: picked.jevError };
 }
 
-export async function markChatLinkSeen(input: { id: string }, _context: PluginHandlerContext): Promise<{ ok: boolean }> {
+export async function markChatLinkSeen(
+  input: {
+    id: string;
+    kind?: "linear" | "pr";
+    label?: string;
+    url?: string;
+    status?: string;
+    stateType?: string | null;
+    checks?: string | null;
+    assignee?: string | null;
+    priority?: string | null;
+  },
+  _context: PluginHandlerContext,
+): Promise<{ ok: boolean }> {
+  await loadSecrets();
   const seen = await readSeen();
-  seen[input.id] = new Date().toISOString();
+  seen[input.id] = snapshotFromItem(
+    {
+      status: input.status ?? "",
+      stateType: input.stateType ?? null,
+      checks: input.checks ?? null,
+      assignee: input.assignee ?? null,
+      priority: input.priority ?? null,
+    },
+    new Date().toISOString(),
+  );
   await writeSeen(seen);
+  const stub: ChatLinkItem = {
+    id: input.id,
+    kind: input.kind ?? "pr",
+    label: input.label ?? input.id,
+    title: "",
+    url: input.url ?? "",
+    status: input.status ?? "",
+    stateType: input.stateType ?? null,
+    avatarUrl: null,
+    assignee: input.assignee ?? null,
+    priority: input.priority ?? null,
+    project: null,
+    checks: input.checks ?? null,
+    needsAttention: false,
+    newComments: 0,
+    reasons: [],
+    updatedAt: null,
+    error: null,
+  };
+  try {
+    if (stub.kind === "pr" && githubToken) {
+      const { threads } = await githubUnread(githubToken, [stub]);
+      await markGithubThreads(githubToken, threads.get(stub.id) ?? []);
+    }
+    if (stub.kind === "linear" && linearToken) {
+      const { ids } = await linearUnread(linearToken, [stub]);
+      await markLinearNotes(linearToken, ids.get(stub.id) ?? []);
+    }
+  } catch (error) {
+    console.log(`chat-links mark-read failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   return { ok: true };
 }
