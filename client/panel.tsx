@@ -1,5 +1,4 @@
 import {
-  type PluginAgentPanelProps,
   type PluginHostProps,
   type PluginWorkspacePanelProps,
   useRpc,
@@ -305,10 +304,6 @@ function LinksScroll({
       />
     </ScrollView>
   );
-}
-
-export function ChatLinksPanel({ theme, layout, agentId }: PluginAgentPanelProps) {
-  return <LinksScreen key={agentId} theme={theme} layout={layout} agentId={agentId} />;
 }
 
 export function ChatLinksWorkspacePanel({ theme, layout }: PluginWorkspacePanelProps) {

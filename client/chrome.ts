@@ -27,14 +27,14 @@ export function contributeChrome(client: PluginClientContext) {
   const agents = agentsApi(client);
   if (!agents?.list) return () => {};
 
-  const pills = new Map<string, PluginButtonRegistration>();
+  const pills = new Map<string, { workspaceId: string; registration: PluginButtonRegistration }>();
   const headers = new Map<string, PluginButtonRegistration>();
   let stopped = false;
   const lifetime = new AbortController();
 
-  const openLinks = (workspaceId: string, agentId: string) => {
-    setFocusedAgent(agentId);
-    client.openPanel("chat-links", { workspaceId, agentId, location: "explorer" });
+  const openLinks = (workspaceId: string, agentId: string | null) => {
+    if (agentId) setFocusedAgent(agentId);
+    client.openPanel("chat-links-workspace", { workspaceId, location: "explorer" });
   };
 
   const register = (agent: AgentRef) => {
@@ -55,21 +55,20 @@ export function contributeChrome(client: PluginClientContext) {
             behavior: {
               kind: "action",
               onPress() {
-                const id = focusedAgentId();
-                if (!id) return;
-                openLinks(workspaceId, id);
+                openLinks(workspaceId, focusedAgentId());
               },
             },
           },
         }),
       );
-
     }
 
-    pills.get(agentId)?.remove();
-    pills.set(
-      agentId,
-      client.addComposerPill({
+    // Re-adding a live pill remounts its icon, which would read as the chat newly coming on screen.
+    if (pills.get(agentId)?.workspaceId === workspaceId) return;
+    pills.get(agentId)?.registration.remove();
+    pills.set(agentId, {
+      workspaceId,
+      registration: client.addComposerPill({
         id: "chat-links",
         workspaceId,
         agentId,
@@ -85,11 +84,11 @@ export function contributeChrome(client: PluginClientContext) {
           },
         },
       }),
-    );
+    });
   };
 
   const removeAgent = (id: string) => {
-    pills.get(id)?.remove();
+    pills.get(id)?.registration.remove();
     pills.delete(id);
   };
 
@@ -105,8 +104,8 @@ export function contributeChrome(client: PluginClientContext) {
       if (result.subscription) {
         result.subscription.subscribe({
           snapshot: ({ entries }) => {
-            for (const pill of pills.values()) pill.remove();
-            pills.clear();
+            const live = new Set(entries.map(({ agent }) => agent.id));
+            for (const id of [...pills.keys()]) if (!live.has(id)) removeAgent(id);
             for (const { agent } of entries) register(agent);
           },
           update: (message) => {
@@ -138,7 +137,7 @@ export function contributeChrome(client: PluginClientContext) {
   return () => {
     stopped = true;
     lifetime.abort();
-    for (const pill of pills.values()) pill.remove();
+    for (const pill of pills.values()) pill.registration.remove();
     pills.clear();
     for (const header of headers.values()) header.remove();
     headers.clear();
